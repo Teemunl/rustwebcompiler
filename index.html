@@ -25,13 +25,13 @@
 <h2>Program output</h2><pre id="out"></pre>
 <h2>Compiler</h2><pre id="rep"></pre>
 <details><summary>Supported subset</summary>
-<p>Functions, <code>i32</code>, <code>bool</code>, <code>()</code>, <code>let</code>/<code>let mut</code>, arithmetic and comparisons, <code>&amp;&amp;</code>/<code>||</code>, <code>if/else</code>, <code>while</code>, <code>loop</code>, <code>for i in a..b</code> and <code>a..=b</code>, <code>break</code>/<code>continue</code>/<code>return</code>, and <code>println!</code>/<code>print!</code> with <code>{}</code>. String literals and <code>"text".repeat(i32)</code> are supported as print arguments. No string variables, structs, references or borrow checking yet. Integer overflow wraps instead of panicking.</p></details>
+<p>Functions, <code>i32</code>, <code>bool</code>, <code>()</code>, <code>let</code>/<code>let mut</code>, arithmetic and comparisons, <code>&amp;&amp;</code>/<code>||</code>, <code>if/else</code>, <code>while</code>, <code>loop</code>, <code>for i in a..b</code> and <code>a..=b</code>, <code>break</code>/<code>continue</code>/<code>return</code>, and <code>println!</code>/<code>print!</code> with <code>{}</code>. String literals can be stored in inferred local variables and printed; <code>"text".repeat(i32)</code> is supported as a print argument. String concatenation and explicit string types are not supported yet. Structs, references and borrow checking are not supported yet. Integer overflow wraps instead of panicking.</p></details>
 
 <script>
 // ===== errors, lexer ========================================================
 class CErr extends Error { constructor(m, line) { super(m); this.line = line; } }
 const err = (m, l) => new CErr(m, l);
-const SUP = 'this compiler supports i32, bool and ()';
+const SUP = 'this compiler supports i32, bool and (); strings are inferred from literals';
 function lex(src) {
   const re = /(\s+|\/\/[^\n]*|\/\*[\s\S]*?\*\/)|([A-Za-z_]\w*)|(\d[\d_]*)|"((?:[^"\\]|\\.)*)"|(->|==|!=|<=|>=|&&|\|\||\+=|-=|\*=|\/=|%=|\.\.=|\.\.|[-+*\/%<>=!&|(){},;:.])/y;
   const t = []; let line = 1, p = 0;
@@ -191,6 +191,7 @@ function genFn(f, sigs) {
     switch (n.k) {
       case 'num': e(0x41, ...sleb(n.v)); return 'i32';
       case 'bool': e(0x41, n.v ? 1 : 0); return 'bool';
+      case 'str': e(0x41, ...sleb(strId(n.v))); return 'str';
       case 'unit': return '()';
       case 'var': { const v = look(n.name); if (!v) throw err(`cannot find value '${n.name}' in this scope`, n.line); e(0x20, ...u(v.idx)); return v.ty; }
       case 'neg': e(0x41, 0); want(gen(n.e), 'i32', n.line); e(0x6b); return 'i32';
@@ -228,23 +229,21 @@ function genFn(f, sigs) {
         if (c) parts.push(c);
         if (parts.filter(p => p === null).length !== n.args.length) throw err('number of {} placeholders does not match number of arguments', n.line);
         const tmp = n.args.map(a => {
-          if (a.k === 'str') return { k: 'str', value: a.v };
           if (a.k === 'repeat') {
             want(gen(a.count), 'i32', a.line);
             const x = nloc++; e(0x21, ...u(x));
             return { k: 'repeat', value: a.value, idx: x };
           }
           const t = gen(a);
-          if (t !== 'i32' && t !== 'bool') throw err(`cannot print a value of type ${t} (only i32, bool, strings and repeated strings)`, a.line || n.line);
+          if (t !== 'i32' && t !== 'bool' && t !== 'str') throw err(`cannot print a value of type ${t} (only i32, bool and strings)`, a.line || n.line);
           const x = nloc++; e(0x21, ...u(x)); return { k: t, idx: x };
         });
         let k2 = 0;
         for (const p of parts) {
           if (p === null) {
             const a = tmp[k2++];
-            if (a.k === 'str') e(0x41, ...sleb(strId(a.value)), 0x10, 2);
-            else if (a.k === 'repeat') e(0x41, ...sleb(strId(a.value)), 0x20, ...u(a.idx), 0x10, 5);
-            else e(0x20, ...u(a.idx), 0x10, a.k === 'i32' ? 1 : 3);
+            if (a.k === 'repeat') e(0x41, ...sleb(strId(a.value)), 0x20, ...u(a.idx), 0x10, 5);
+            else e(0x20, ...u(a.idx), 0x10, a.k === 'i32' ? 1 : a.k === 'str' ? 2 : 3);
           } else e(0x41, ...sleb(strId(p)), 0x10, 2);
         }
         if (n.nl) e(0x10, 4);
@@ -375,6 +374,13 @@ function run() {
 
 // ===== examples and wiring ==================================================
 const EX = {
+  'String variables': `fn main() {
+    let greeting = "Hello";
+    let mut language = "Rust";
+    language = "WebAssembly";
+    println!("{}, {}!", greeting, language);
+}
+`,
   'fib + primes': `fn fib(n: i32) -> i32 {
     if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
 }
