@@ -1,6 +1,3 @@
-// slot-jit-demo.mjs — one wasm module per function, linked through a shared table.
-// Tested on Node 22. Run: node slot-jit-demo.mjs
-// Shows: hand-rolled wasm emitter, lazy stubs (compile on first call), self-recursion via table, hot swap.
 const enc = new TextEncoder();
 const u = n => { const o = []; do { let b = n & 127; n >>>= 7; if (n) b |= 128; o.push(b); } while (n); return o; };
 const sleb = n => { const o = []; for (;;) { const b = n & 127; n >>= 7; if ((n === 0 && !(b & 64)) || (n === -1 && (b & 64))) { o.push(b); return o; } o.push(b | 128); } };
@@ -27,7 +24,7 @@ const mem = new WebAssembly.Memory({ initial: 16 });
 const tbl = new WebAssembly.Table({ initial: 16, element: 'anyfunc' });
 const sp = new WebAssembly.Global({ value: 'i32', mutable: true }, 1 << 20);
 const SIG = fnType([I32], [I32]);
-const fns = {};            // id -> { sig, build() }
+const fns = {};
 let compiles = 0;
 const env = { mem, tbl, sp, compile: id => install(id) };
 const make = bytes => new WebAssembly.Instance(new WebAssembly.Module(bytes), { env }).exports.f;
@@ -39,13 +36,13 @@ function stub(id) {
 function install(id) { compiles++; tbl.set(id, make(fns[id].build())); }
 function declare(id, build) { fns[id] = { build }; tbl.set(id, stub(id)); }
 
-// fib calls itself through table slot 1
 const fibBody = [0x20,0, ...constI32(2), 0x48, 0x04,0x7f, 0x20,0, 0x05,
   0x20,0, ...constI32(1), 0x6b, ...constI32(1), 0x11,0,0,
   0x20,0, ...constI32(2), 0x6b, ...constI32(1), 0x11,0,0, 0x6a, 0x0b];
 declare(1, () => emit({ types: [SIG], body: fibBody }));
-console.log('fib(20) =', tbl.get(1)(20), 'compiles:', compiles);
 
-// hot swap: redefine fib as "return n*2" (same signature) -> callers pick it up
+const result = tbl.get(1)(20);
 tbl.set(1, make(emit({ types: [SIG], body: [0x20,0, ...constI32(2), 0x6c] })));
-console.log('after swap fib(20) =', tbl.get(1)(20));
+const swapped = tbl.get(1)(20);
+document.querySelector('#output').textContent =
+  `fib(20) = ${result}; compiles: ${compiles}\nafter hot swap = ${swapped}`;
