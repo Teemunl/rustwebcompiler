@@ -2,6 +2,6 @@
 
 A no-build Rust-subset compiler that runs in the browser. The single `index.html` file contains the lexer, Pratt parser, type checker, Wasm emitter, runtime, and UI. It uses native browser APIs only; there are no external libraries or build tools.
 
-Open the page from a static web server or publish this folder with GitHub Pages. Choose an example or type a program, then select **Run** (or press Ctrl+Enter). Each function is emitted as a small Wasm module and compiled lazily through a shared table; unchanged modules are kept across runs.
+Each function is emitted as a small Wasm module and compiled lazily through a shared table; unchanged modules are kept across runs.
 
 Supported syntax and current limitations are listed in the page under **Supported subset**.
