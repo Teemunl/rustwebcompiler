@@ -1,14 +1,400 @@
 <!doctype html>
 <html lang="en">
+<head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>rustwebcompiler</title>
+<title>Rust slot-JIT: a tiny Rust compiler in your browser</title>
 <style>
-body{font:16px system-ui,sans-serif;max-width:48rem;margin:3rem auto;padding:0 1rem;color:#222}
-pre{padding:1rem;background:#f3f3f3;white-space:pre-wrap}
+  :root { color-scheme: light dark; --bg:#fff; --fg:#1a1a1a; --mut:#666; --card:#f4f4f5; --acc:#c2410c; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#161616; --fg:#eaeaea; --mut:#9a9a9a; --card:#232323; --acc:#fb923c; } }
+  body { background:var(--bg); color:var(--fg); font:15px/1.5 system-ui, sans-serif; max-width:50rem; margin:1.5rem auto; padding:0 1rem; }
+  h1 { font-size:1.25rem; margin:0 0 .25rem; } p, summary { color:var(--mut); }
+  textarea, pre { font:13px/1.45 ui-monospace, Menlo, Consolas, monospace; background:var(--card); color:var(--fg); border:1px solid transparent; border-radius:8px; padding:.75rem; width:100%; box-sizing:border-box; }
+  textarea { height:22rem; resize:vertical; tab-size:4; } pre { margin:.5rem 0; white-space:pre-wrap; overflow-x:auto; min-height:2.5rem; }
+  .row { display:flex; gap:.5rem; align-items:center; margin:.5rem 0; }
+  button, select { font:inherit; padding:.4rem .9rem; border:1px solid var(--mut); border-radius:6px; background:var(--card); color:var(--fg); cursor:pointer; }
+  button:hover { border-color:var(--acc); } .err { color:var(--acc); }
+  h2 { font-size:.8rem; text-transform:uppercase; letter-spacing:.05em; color:var(--mut); margin:1rem 0 0; }
 </style>
-<h1>rustwebcompiler</h1>
-<p>Handwritten JavaScript emits WebAssembly in the browser, with lazy compilation, table-based recursion, and hot swapping.</p>
-<pre id="output">Running demo…</pre>
-<script type="module" src="./slot-jit-demo.js"></script>
+</head>
+<body>
+<h1>Rust slot-JIT</h1>
+<p>Type Rust. Each function becomes its own tiny wasm module, linked through one shared table and compiled on first call. Edit and run again to hot-swap only what changed.</p>
+<div class="row"><button id="run">Run (Ctrl+Enter)</button><select id="ex"></select></div>
+<textarea id="src" spellcheck="false"></textarea>
+<h2>Program output</h2><pre id="out"></pre>
+<h2>Compiler</h2><pre id="rep"></pre>
+<details><summary>Supported subset</summary>
+<p>Functions, <code>i32</code>, <code>bool</code>, <code>()</code>, <code>let</code>/<code>let mut</code>, arithmetic and comparisons, <code>&amp;&amp;</code>/<code>||</code>, <code>if/else</code>, <code>while</code>, <code>loop</code>, <code>for i in a..b</code> and <code>a..=b</code>, <code>break</code>/<code>continue</code>/<code>return</code>, <code>println!</code>/<code>print!</code> with <code>{}</code>. No structs, strings, references or borrow checking yet. Integer overflow wraps instead of panicking.</p></details>
+
+<script>
+// ===== errors, lexer ========================================================
+class CErr extends Error { constructor(m, line) { super(m); this.line = line; } }
+const err = (m, l) => new CErr(m, l);
+const SUP = 'this compiler supports i32, bool and ()';
+function lex(src) {
+  const re = /(\s+|\/\/[^\n]*|\/\*[\s\S]*?\*\/)|([A-Za-z_]\w*)|(\d[\d_]*)|"((?:[^"\\]|\\.)*)"|(->|==|!=|<=|>=|&&|\|\||\+=|-=|\*=|\/=|%=|\.\.=|\.\.|[-+*\/%<>=!&|(){},;:])/y;
+  const t = []; let line = 1, p = 0;
+  while (p < src.length) {
+    re.lastIndex = p; const m = re.exec(src);
+    if (!m) throw err(`unexpected character '${src[p]}'`, line);
+    p = re.lastIndex;
+    if (m[1]) line += (m[1].match(/\n/g) || []).length;
+    else if (m[2] !== undefined) t.push({ t: 'id', v: m[2], line });
+    else if (m[3] !== undefined) t.push({ t: 'num', v: +m[3].replace(/_/g, ''), line });
+    else if (m[4] !== undefined) t.push({ t: 'str', v: m[4].replace(/\\(.)/g, (_, c) => c === 'n' ? '\n' : c), line });
+    else t.push({ t: 'p', v: m[5], line });
+  }
+  t.push({ t: 'eof', v: '<end of file>', line }); return t;
+}
+
+// ===== parser (Pratt) =======================================================
+const BP = { '||':1, '&&':2, '==':3, '!=':3, '<':3, '>':3, '<=':3, '>=':3, '+':4, '-':4, '*':5, '/':5, '%':5 };
+const BL = new Set(['if', 'while', 'for', 'loop', 'block']);
+const lit = (v, line) => { if (v > 2147483647 || v < -2147483648) throw err('integer literal out of range for i32', line); return { k: 'num', v, line }; };
+function parse(toks) {
+  let i = 0;
+  const pk = () => toks[i], nx = () => toks[i++];
+  const is = v => { const k = toks[i]; return k.v === v && k.t !== 'str' && k.t !== 'num'; };
+  const eat = v => is(v) ? (i++, true) : false;
+  const expect = v => { if (!is(v)) throw err(`expected '${v}', found '${pk().v}'`, pk().line); return nx(); };
+  const ident = () => { const k = pk(); if (k.t !== 'id') throw err(`expected a name, found '${k.v}'`, k.line); return nx().v; };
+  const ty = () => { const k = nx(); if (k.v === '(' && eat(')')) return '()'; if (k.v === 'i32' || k.v === 'bool') return k.v; throw err(`unsupported type '${k.v}' (${SUP})`, k.line); };
+  function block() {
+    const line = expect('{').line, stmts = []; let tail = null;
+    while (!is('}')) {
+      if (pk().t === 'eof') throw err("unclosed '{'", line);
+      if (eat(';')) continue;
+      if (is('let')) {
+        const l = nx().line, mut = eat('mut'), name = ident(), t = eat(':') ? ty() : null;
+        expect('='); const init = expr(); expect(';');
+        stmts.push({ k: 'let', name, mut, ty: t, init, line: l }); continue;
+      }
+      const e = expr(), op = ['=', '+=', '-=', '*=', '/=', '%='].find(o => is(o));
+      if (op) { nx(); const rhs = expr(); expect(';'); stmts.push({ k: 'assign', target: e, op, rhs, line: e.line }); continue; }
+      if (eat(';')) { stmts.push({ k: 'expr', e }); continue; }
+      if (is('}')) { tail = e; break; }
+      if (BL.has(e.k)) { stmts.push({ k: 'expr', e }); continue; }
+      throw err(`expected ';' or '}', found '${pk().v}'`, pk().line);
+    }
+    expect('}'); return { k: 'block', stmts, tail, line };
+  }
+  function ifx() {
+    const line = nx().line, c = expr(), t = block(); let f = null;
+    if (eat('else')) f = is('if') ? ifx() : block();
+    return { k: 'if', c, t, f, line };
+  }
+  function primary() {
+    const k = pk(), line = k.line;
+    if (k.t === 'num') { nx(); return lit(k.v, line); }
+    if (k.t === 'id') {
+      if (k.v === 'true' || k.v === 'false') { nx(); return { k: 'bool', v: k.v === 'true', line }; }
+      if (k.v === 'if') return ifx();
+      if (k.v === 'while') { nx(); const c = expr(); return { k: 'while', c, body: block(), line }; }
+      if (k.v === 'loop') { nx(); return { k: 'loop', body: block(), line }; }
+      if (k.v === 'for') {
+        nx(); const name = ident(); expect('in'); const lo = expr(), inc = is('..=');
+        nx(); const hi = expr(); return { k: 'for', name, lo, hi, inc, body: block(), line };
+      }
+      if (k.v === 'return') { nx(); return { k: 'return', e: is(';') || is('}') ? null : expr(), line }; }
+      if (k.v === 'break' || k.v === 'continue') { nx(); return { k: k.v, line }; }
+      nx();
+      if ((k.v === 'println' || k.v === 'print') && is('!')) {
+        nx(); expect('('); let fmt = '';
+        if (pk().t === 'str') fmt = nx().v; else if (!is(')')) throw err('the first macro argument must be a string literal', line);
+        const args = []; while (eat(',')) if (!is(')')) args.push(expr());
+        expect(')'); return { k: 'print', nl: k.v === 'println', fmt, args, line };
+      }
+      if (eat('(')) { const args = []; while (!is(')')) { args.push(expr()); if (!eat(',')) break; } expect(')'); return { k: 'call', name: k.v, args, line }; }
+      return { k: 'var', name: k.v, line };
+    }
+    if (k.v === '(') { nx(); if (eat(')')) return { k: 'unit', line }; const e = expr(); expect(')'); return e; }
+    if (k.v === '{') return block();
+    throw err(`unexpected '${k.v}'`, line);
+  }
+  function unary() {
+    const k = pk();
+    if (k.t === 'p' && k.v === '-') { nx(); if (pk().t === 'num') return lit(-nx().v, k.line); return { k: 'neg', e: unary(), line: k.line }; }
+    if (k.t === 'p' && k.v === '!') { nx(); return { k: 'not', e: unary(), line: k.line }; }
+    return primary();
+  }
+  function expr(min = 0) {
+    let l = unary();
+    for (;;) {
+      const k = pk(), bp = k.t === 'p' ? BP[k.v] : undefined;
+      if (!bp || bp <= min) break;
+      nx(); l = { k: 'bin', op: k.v, l, r: expr(bp), line: k.line };
+    }
+    return l;
+  }
+  const items = [];
+  while (pk().t !== 'eof') {
+    eat('pub'); const k = pk();
+    if (!is('fn')) throw err(`unsupported item '${k.v}' (only fn items are supported)`, k.line);
+    const line = nx().line, name = ident(); expect('('); const params = [];
+    while (!is(')')) { const mut = eat('mut'), n = ident(); expect(':'); params.push({ name: n, ty: ty(), mut }); if (!eat(',')) break; }
+    expect(')'); const ret = eat('->') ? ty() : '()';
+    items.push({ name, params, ret, body: block(), line });
+  }
+  return items;
+}
+
+// ===== wasm emitter =========================================================
+const enc = new TextEncoder();
+const u = n => { const o = []; do { let b = n & 127; n >>>= 7; if (n) b |= 128; o.push(b); } while (n); return o; };
+const sleb = n => { const o = []; for (;;) { const b = n & 127; n >>= 7; if ((n === 0 && !(b & 64)) || (n === -1 && (b & 64))) { o.push(b); return o; } o.push(b | 128); } };
+const vec = xs => [...u(xs.length), ...xs.flat()];
+const name = t => { const b = enc.encode(t); return [...u(b.length), ...b]; };
+const section = (id, body) => [id, ...u(body.length), ...body];
+const I32 = 0x7f;
+const fnType = (ps, rs) => [0x60, ...vec(ps.map(p => [p])), ...vec(rs.map(r => [r]))];
+const sigOf = (n, r) => fnType(Array(n).fill(I32), r ? [I32] : []);
+const imp = (m, n, d) => [...name(m), ...name(n), ...d];
+// Every module: imports table e.t and funcs e.c (compile), e.i (print i32), e.s (print str), e.b (print bool), e.n (newline)
+function buildModule(n, r, nl, body, tys) {
+  const types = [sigOf(n, r), fnType([I32], []), fnType([], []), ...tys.map(([a, b]) => sigOf(a, b))];
+  const imports = [imp('e','t',[1,0x70,0,0]), imp('e','c',[0,1]), imp('e','i',[0,1]), imp('e','s',[0,1]), imp('e','b',[0,1]), imp('e','n',[0,2])];
+  const code = [...vec(nl ? [[...u(nl), I32]] : []), ...body, 0x0b];
+  return new Uint8Array([0,0x61,0x73,0x6d, 1,0,0,0,
+    ...section(1, vec(types)), ...section(2, vec(imports)), ...section(3, vec([[0]])),
+    ...section(7, vec([[...name('f'), 0, 5]])), ...section(10, vec([[...u(code.length), ...code]]))]);
+}
+const STR = [], SM = new Map();
+const strId = s => { if (!SM.has(s)) { SM.set(s, STR.length); STR.push(s); } return SM.get(s); };
+
+// ===== code generator: one Rust fn -> one wasm module =======================
+function genFn(f, sigs) {
+  let out = [], nloc = f.params.length; const scopes = [new Map()], ctl = [], tys = [];
+  const e = (...b) => { out.push(...b); };
+  f.params.forEach((p, k) => scopes[0].set(p.name, { idx: k, ty: p.ty, mut: p.mut }));
+  const look = n => { for (let k = scopes.length; k--;) if (scopes[k].has(n)) return scopes[k].get(n); };
+  const decl = (n, ty, mut) => { const idx = nloc++; scopes.at(-1).set(n, { idx, ty, mut }); return idx; };
+  const cap = fn => { const s = out; out = []; const r = fn(); const b = out; out = s; return [b, r]; };
+  const tIdx = (n, r) => { let k = tys.findIndex(t => t[0] === n && t[1] === r); if (k < 0) k = tys.push([n, r]) - 1; return 3 + k; };
+  const tgt = tag => { for (let k = ctl.length; k--;) if (ctl[k].tag === tag) return k; return -1; };
+  const dist = tag => ctl.length - 1 - tgt(tag);
+  const want = (got, exp, line) => { if (got !== '!' && got !== exp) throw err(`mismatched types: expected ${exp}, found ${got}`, line); };
+  const unit = (t, n) => { if (t !== '()' && t !== '!') throw err(`loop body must evaluate to (), found ${t}`, n.line); };
+  const A = { '+':0x6a, '-':0x6b, '*':0x6c, '/':0x6d, '%':0x6f }, C = { '==':0x46, '!=':0x47, '<':0x48, '>':0x4a, '<=':0x4c, '>=':0x4e };
+  const gen = n => { const t = g(n); if (t === '!') e(0); return t; };   // a diverging expr is followed by `unreachable`
+  const g = n => {
+    switch (n.k) {
+      case 'num': e(0x41, ...sleb(n.v)); return 'i32';
+      case 'bool': e(0x41, n.v ? 1 : 0); return 'bool';
+      case 'unit': return '()';
+      case 'var': { const v = look(n.name); if (!v) throw err(`cannot find value '${n.name}' in this scope`, n.line); e(0x20, ...u(v.idx)); return v.ty; }
+      case 'neg': e(0x41, 0); want(gen(n.e), 'i32', n.line); e(0x6b); return 'i32';
+      case 'not': want(gen(n.e), 'bool', n.line); e(0x45); return 'bool';
+      case 'bin': {
+        const o = n.op;
+        if (o === '&&' || o === '||') {
+          want(gen(n.l), 'bool', n.line); ctl.push({ tag: 'if' });
+          const [b, t] = cap(() => gen(n.r)); ctl.pop(); want(t, 'bool', n.line);
+          if (o === '&&') e(4, 0x7f, ...b, 5, 0x41, 0, 0x0b); else e(4, 0x7f, 0x41, 1, 5, ...b, 0x0b);
+          return 'bool';
+        }
+        const lt = gen(n.l), rt = gen(n.r);
+        if (o in A) { want(lt, 'i32', n.line); want(rt, 'i32', n.line); e(A[o]); return 'i32'; }
+        if (o === '==' || o === '!=') { want(rt, lt, n.line); if (lt === '()') throw err('cannot compare () values', n.line); }
+        else { want(lt, 'i32', n.line); want(rt, 'i32', n.line); }
+        e(C[o]); return 'bool';
+      }
+      case 'call': {
+        const s = sigs.get(n.name); if (!s) throw err(`cannot find function '${n.name}' in this scope`, n.line);
+        if (s.params.length !== n.args.length) throw err(`function '${n.name}' takes ${s.params.length} argument(s) but ${n.args.length} were supplied`, n.line);
+        n.args.forEach((a, k) => want(gen(a), s.params[k], a.line || n.line));
+        e(0x41, ...sleb(s.id), 0x11, ...u(tIdx(s.params.length, s.ret === '()' ? 0 : 1)), 0);
+        return s.ret;
+      }
+      case 'print': {
+        const parts = []; let c = ''; const F = n.fmt;
+        for (let k = 0; k < F.length; k++) {
+          const ch = F[k], nx2 = F[k + 1];
+          if (ch === '{' && nx2 === '{') { c += '{'; k++; } else if (ch === '}' && nx2 === '}') { c += '}'; k++; }
+          else if (ch === '{' && nx2 === '}') { if (c) parts.push(c); c = ''; parts.push(null); k++; }
+          else if (ch === '{' || ch === '}') throw err('only {} placeholders are supported in format strings', n.line);
+          else c += ch;
+        }
+        if (c) parts.push(c);
+        if (parts.filter(p => p === null).length !== n.args.length) throw err('number of {} placeholders does not match number of arguments', n.line);
+        const tmp = n.args.map(a => {   // evaluate every argument first, like Rust does
+          const t = gen(a); if (t !== 'i32' && t !== 'bool') throw err(`cannot print a value of type ${t} (only i32 and bool)`, a.line || n.line);
+          const x = nloc++; e(0x21, ...u(x)); return [x, t];
+        });
+        let k2 = 0;
+        for (const p of parts) { if (p === null) { const [x, t] = tmp[k2++]; e(0x20, ...u(x), 0x10, t === 'i32' ? 1 : 3); } else e(0x41, ...sleb(strId(p)), 0x10, 2); }
+        if (n.nl) e(0x10, 4);
+        return '()';
+      }
+      case 'block': {
+        scopes.push(new Map()); let dv = false;
+        for (const s of n.stmts) {
+          if (s.k === 'let') {
+            const t = gen(s.init); if (t === '()') throw err('cannot bind a () value to a variable', s.line);
+            if (s.ty) want(t, s.ty, s.line);
+            e(0x21, ...u(decl(s.name, t === '!' ? (s.ty || 'i32') : t, s.mut)));
+          } else if (s.k === 'assign') {
+            if (s.target.k !== 'var') throw err('invalid left-hand side of assignment', s.line);
+            const v = look(s.target.name); if (!v) throw err(`cannot find value '${s.target.name}' in this scope`, s.line);
+            if (!v.mut) throw err(`cannot assign twice to immutable variable '${s.target.name}' (declare it with 'let mut')`, s.line);
+            const cmp = s.op !== '=';
+            if (cmp) { want(v.ty, 'i32', s.line); e(0x20, ...u(v.idx)); }
+            want(gen(s.rhs), cmp ? 'i32' : v.ty, s.line);
+            if (cmp) e(A[s.op[0]]);
+            e(0x21, ...u(v.idx));
+          } else { const t = gen(s.e); if (t === '!') dv = true; else if (t !== '()') e(0x1a); }
+        }
+        const t = n.tail ? gen(n.tail) : dv ? '!' : '()'; scopes.pop(); return t;
+      }
+      case 'if': {
+        want(gen(n.c), 'bool', n.line); ctl.push({ tag: 'if' });
+        const [tb, tt] = cap(() => gen(n.t)), [fb, ft] = n.f ? cap(() => gen(n.f)) : [null, '()'];
+        ctl.pop(); let rt;
+        if (!n.f) { if (tt !== '()' && tt !== '!') throw err(`'if' without 'else' must evaluate to (), found ${tt}`, n.line); rt = '()'; }
+        else if (tt === '!') rt = ft; else if (ft === '!' || ft === tt) rt = tt;
+        else throw err(`'if' and 'else' have incompatible types: ${tt} vs ${ft}`, n.line);
+        e(4, rt === 'i32' || rt === 'bool' ? 0x7f : 0x40, ...tb); if (fb) e(5, ...fb); e(0x0b); return rt;
+      }
+      case 'while':
+        ctl.push({ tag: 'brk' }); e(2, 0x40); ctl.push({ tag: 'cont' }); e(3, 0x40);
+        want(gen(n.c), 'bool', n.line); e(0x45, 0x0d, ...u(dist('brk')));
+        unit(gen(n.body), n); e(0x0c, ...u(dist('cont'))); ctl.pop(); e(0x0b); ctl.pop(); e(0x0b); return '()';
+      case 'loop': {
+        const b = { tag: 'brk' }; ctl.push(b); e(2, 0x40); ctl.push({ tag: 'cont' }); e(3, 0x40);
+        unit(gen(n.body), n); e(0x0c, ...u(dist('cont'))); ctl.pop(); e(0x0b); ctl.pop(); e(0x0b);
+        return b.used ? '()' : '!';
+      }
+      case 'for': {
+        want(gen(n.lo), 'i32', n.line); want(gen(n.hi), 'i32', n.line);
+        const ev = nloc++; e(0x21, ...u(ev)); scopes.push(new Map());
+        const iv = decl(n.name, 'i32', false); e(0x21, ...u(iv));
+        ctl.push({ tag: 'brk' }); e(2, 0x40); ctl.push({ tag: 'top' }); e(3, 0x40);
+        e(0x20, ...u(iv), 0x20, ...u(ev), n.inc ? 0x4a : 0x4e, 0x0d, ...u(dist('brk')));
+        ctl.push({ tag: 'cont' }); e(2, 0x40); unit(gen(n.body), n); ctl.pop(); e(0x0b);
+        e(0x20, ...u(iv), 0x41, 1, 0x6a, 0x21, ...u(iv), 0x0c, ...u(dist('top')));
+        ctl.pop(); e(0x0b); ctl.pop(); e(0x0b); scopes.pop(); return '()';
+      }
+      case 'break': { const k = tgt('brk'); if (k < 0) throw err("'break' outside of a loop", n.line); ctl[k].used = true; e(0x0c, ...u(ctl.length - 1 - k)); return '!'; }
+      case 'continue': { const k = tgt('cont'); if (k < 0) throw err("'continue' outside of a loop", n.line); e(0x0c, ...u(ctl.length - 1 - k)); return '!'; }
+      case 'return':
+        if (n.e) want(gen(n.e), f.ret, n.line); else if (f.ret !== '()') throw err(`'return' needs a value of type ${f.ret}`, n.line);
+        e(0x0f); return '!';
+    }
+    throw err('unsupported expression', n.line);
+  };
+  const bt = gen(f.body);
+  if (bt !== '!' && bt !== f.ret) throw err(`function '${f.name}' should return ${f.ret} but its body evaluates to ${bt}`, f.line);
+  return buildModule(f.params.length, f.ret === '()' ? 0 : 1, nloc - f.params.length, out, tys);
+}
+
+// ===== runtime: shared table, lazy stubs, hot swap ==========================
+const tbl = new WebAssembly.Table({ initial: 8, element: 'anyfunc' });
+let buf = '', byId = [], cur = new Map(), ids = new Map(), nid = 1, inst = 0;
+const w = x => { buf += x; if (buf.length > 3e5) throw new Error('output limit exceeded'); };
+const mk = bytes => new WebAssembly.Instance(new WebAssembly.Module(bytes), { e: env }).exports.f;
+const env = {
+  t: tbl,
+  c: id => { const f = byId[id];   // first call of a function: compile its module now
+    try { tbl.set(id, mk(f.bytes)); } catch (x) { if (x instanceof WebAssembly.CompileError) throw new Error(`internal compiler error in '${f.name}': ${x.message}`); throw x; }
+    f.inst = true; inst++; },
+  i: v => w(v), s: k => w(STR[k]), b: v => w(v ? 'true' : 'false'), n: () => w('\n'),
+};
+function stubFor(f) {
+  const body = [0x41, ...sleb(f.id), 0x10, 0];
+  for (let k = 0; k < f.n; k++) body.push(0x20, ...u(k));
+  body.push(0x41, ...sleb(f.id), 0x11, 0, 0);
+  return mk(buildModule(f.n, f.r, 0, body, []));
+}
+const $ = id => document.getElementById(id);
+function run() {
+  buf = ''; inst = 0; const rep = [];
+  try {
+    const items = parse(lex($('src').value)), sigs = new Map();
+    for (const f of items) {
+      if (sigs.has(f.name)) throw err(`the name '${f.name}' is defined multiple times`, f.line);
+      if (!ids.has(f.name)) ids.set(f.name, nid++);
+      sigs.set(f.name, { id: ids.get(f.name), params: f.params.map(p => p.ty), ret: f.ret });
+    }
+    const m = sigs.get('main');
+    if (!m) throw err("no 'fn main()' found", 1);
+    if (m.params.length || m.ret !== '()') throw err("'main' must take no arguments and return ()", 1);
+    const next = new Map(); let size = 0;
+    for (const f of items) {
+      const bytes = genFn(f, sigs); size += bytes.length;
+      next.set(f.name, { name: f.name, id: sigs.get(f.name).id, bytes, key: bytes.join(), n: f.params.length, r: f.ret === '()' ? 0 : 1 });
+    }
+    for (const [nm, o] of cur) if (!next.has(nm)) { tbl.set(o.id, null); byId[o.id] = null; rep.push(`${nm}: removed`); }
+    for (const [nm, f] of next) {
+      const o = cur.get(nm); while (tbl.length <= f.id) tbl.grow(8); byId[f.id] = f;
+      if (o && o.key === f.key) { f.inst = o.inst; rep.push(`${nm}: unchanged, kept`); }   // identical bytes: keep the live instance
+      else { f.inst = false; tbl.set(f.id, stubFor(f)); rep.push(`${nm}: ${o ? 'changed, hot-swapped' : 'new'}`); }
+    }
+    cur = next; rep.unshift(`${items.length} function(s), ${size} bytes of wasm`);
+    let fail = '';
+    try { tbl.get(m.id)(); }
+    catch (x) { fail = x instanceof WebAssembly.RuntimeError ? `thread 'main' panicked: ${x.message}` : x instanceof RangeError ? "thread 'main' overflowed its stack" : String(x.message || x); }
+    $('out').textContent = buf + (fail ? '\n' + fail : '');
+    rep.push(`ran main: ${inst} function module(s) instantiated lazily this run`);
+    $('rep').className = ''; $('rep').textContent = rep.join('\n');
+  } catch (x) {
+    $('out').textContent = '';
+    $('rep').className = 'err';
+    $('rep').textContent = x instanceof CErr ? `error: ${x.message}\n  --> line ${x.line}` : 'internal error: ' + (x.message || x);
+  }
+}
+
+// ===== examples and wiring ==================================================
+const EX = {
+  'fib + primes': `fn fib(n: i32) -> i32 {
+    if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
+}
+
+fn is_prime(n: i32) -> bool {
+    if n < 2 { return false; }
+    let mut d = 2;
+    while d * d <= n {
+        if n % d == 0 { return false; }
+        d += 1;
+    }
+    true
+}
+
+fn main() {
+    println!("fib(25) = {}", fib(25));
+    for n in 1..=30 {
+        if is_prime(n) { println!("{} is prime", n); }
+    }
+}
+`,
+  'FizzBuzz': `fn main() {
+    for i in 1..=15 {
+        if i % 15 == 0 { println!("FizzBuzz"); }
+        else if i % 3 == 0 { println!("Fizz"); }
+        else if i % 5 == 0 { println!("Buzz"); }
+        else { println!("{}", i); }
+    }
+}
+`,
+  'Collatz (loop/break)': `fn steps(mut n: i32) -> i32 {
+    let mut count = 0;
+    loop {
+        if n == 1 { break; }
+        n = if n % 2 == 0 { n / 2 } else { 3 * n + 1 };
+        count += 1;
+    }
+    count
+}
+
+fn main() {
+    for n in 1..=10 { println!("collatz({}) = {}", n, steps(n)); }
+}
+`,
+};
+for (const k of Object.keys(EX)) $('ex').add(new Option(k, k));
+$('ex').onchange = () => { $('src').value = EX[$('ex').value]; run(); };
+$('run').onclick = run;
+$('src').addEventListener('keydown', ev => { if ((ev.ctrlKey || ev.metaKey) && ev.key === 'Enter') { ev.preventDefault(); run(); } });
+$('src').value = EX['fib + primes']; run();
+</script>
+</body>
 </html>
