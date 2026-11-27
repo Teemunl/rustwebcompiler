@@ -11,7 +11,8 @@
   h1 { font-size:1.25rem; margin:0 0 .25rem; } p, summary { color:var(--mut); }
   textarea, pre { font:13px/1.45 ui-monospace, Menlo, Consolas, monospace; background:var(--card); color:var(--fg); border:1px solid transparent; border-radius:8px; padding:.75rem; width:100%; box-sizing:border-box; }
   textarea { height:22rem; resize:vertical; tab-size:4; } pre { margin:.5rem 0; white-space:pre-wrap; overflow-x:auto; min-height:2.5rem; }
-  .row { display:flex; gap:.5rem; align-items:center; margin:.5rem 0; }
+  canvas { display:block; width:100%; max-width:480px; height:auto; aspect-ratio:2; background:var(--card); border-radius:8px; }
+  .row { display:flex; flex-wrap:wrap; gap:.5rem; align-items:center; margin:.5rem 0; }
   button, select { font:inherit; padding:.4rem .9rem; border:1px solid var(--mut); border-radius:6px; background:var(--card); color:var(--fg); cursor:pointer; }
   button:hover { border-color:var(--acc); } .err { color:var(--acc); }
   h2 { font-size:.8rem; text-transform:uppercase; letter-spacing:.05em; color:var(--mut); margin:1rem 0 0; }
@@ -20,12 +21,13 @@
 <body>
 <h1>Rust-like subset compiler</h1>
 <p>This is a custom compiler for a small Rust-inspired language, not the official rustc. It compiles supported syntax into WebAssembly and runs it in your browser. Edit and run again to hot-swap changed functions.</p>
-<div class="row"><button id="run">Run (Ctrl+Enter)</button><select id="ex"></select></div>
+<div class="row"><button id="run">Run (Ctrl+Enter)</button><select id="ex"></select><button id="stop" type="button" disabled>Stop animation</button></div>
 <textarea id="src" spellcheck="false"></textarea>
+<h2>Animation</h2><canvas id="scene" width="480" height="240" aria-label="Rust-like program animation"></canvas>
 <h2>Program output</h2><pre id="out"></pre>
 <h2>Compiler</h2><pre id="rep"></pre>
 <details><summary>Supported subset</summary>
-<p>Functions, <code>i32</code>, <code>bool</code>, <code>()</code>, <code>String</code>, <code>&amp;str</code>, <code>let</code>/<code>let mut</code>, arithmetic and comparisons, <code>&amp;&amp;</code>/<code>||</code>, <code>if/else</code>, <code>while</code>, <code>loop</code>, <code>for i in a..b</code> and <code>a..=b</code>, <code>break</code>/<code>continue</code>/<code>return</code>, and <code>println!</code>/<code>print!</code> with <code>{}</code>. String values can be concatenated with <code>+</code>; both string types use the compiler's simple interned-string representation, without Rust ownership or borrowing semantics. <code>"text".repeat(i32)</code> is supported as a print argument. Structs, general references and borrow checking are not supported yet. Integer overflow wraps instead of panicking.</p></details>
+<p>Functions, <code>i32</code>, <code>bool</code>, <code>()</code>, <code>String</code>, <code>&amp;str</code>, <code>let</code>/<code>let mut</code>, arithmetic and comparisons, <code>&amp;&amp;</code>/<code>||</code>, <code>if/else</code>, <code>while</code>, <code>loop</code>, <code>for i in a..b</code> and <code>a..=b</code>, <code>break</code>/<code>continue</code>/<code>return</code>, and <code>println!</code>/<code>print!</code> with <code>{}</code>. String values can be concatenated with <code>+</code>; both string types use the compiler's simple interned-string representation, without Rust ownership or borrowing semantics. <code>"text".repeat(i32)</code> is supported as a print argument. Animation programs can define <code>fn frame(t: i32)</code> and call the built-in <code>draw_ball(x, y, radius)</code>. Structs, general references and borrow checking are not supported yet. Integer overflow wraps instead of panicking.</p></details>
 
 <script>
 // ===== errors, lexer ========================================================
@@ -167,14 +169,14 @@ const I32 = 0x7f;
 const fnType = (ps, rs) => [0x60, ...vec(ps.map(p => [p])), ...vec(rs.map(r => [r]))];
 const sigOf = (n, r) => fnType(Array(n).fill(I32), r ? [I32] : []);
 const imp = (m, n, d) => [...name(m), ...name(n), ...d];
-// Every module: imports table e.t and funcs e.c (compile), e.i (print i32), e.s (print str), e.b (print bool), e.n (newline), e.r (repeat str), e.q (concat strings)
+// Every module: imports table e.t and funcs e.c (compile), e.i (print i32), e.s (print str), e.b (print bool), e.n (newline), e.r (repeat str), e.q (concat strings), e.d (draw ball)
 function buildModule(n, r, nl, body, tys) {
-  const types = [sigOf(n, r), fnType([I32], []), fnType([], []), fnType([I32, I32], []), fnType([I32, I32], [I32]), ...tys.map(([a, b]) => sigOf(a, b))];
-  const imports = [imp('e','t',[1,0x70,0,0]), imp('e','c',[0,1]), imp('e','i',[0,1]), imp('e','s',[0,1]), imp('e','b',[0,1]), imp('e','n',[0,2]), imp('e','r',[0,3]), imp('e','q',[0,4])];
+  const types = [sigOf(n, r), fnType([I32], []), fnType([], []), fnType([I32, I32], []), fnType([I32, I32], [I32]), fnType([I32, I32, I32], []), ...tys.map(([a, b]) => sigOf(a, b))];
+  const imports = [imp('e','t',[1,0x70,0,0]), imp('e','c',[0,1]), imp('e','i',[0,1]), imp('e','s',[0,1]), imp('e','b',[0,1]), imp('e','n',[0,2]), imp('e','r',[0,3]), imp('e','q',[0,4]), imp('e','d',[0,5])];
   const code = [...vec(nl ? [[...u(nl), I32]] : []), ...body, 0x0b];
   return new Uint8Array([0,0x61,0x73,0x6d, 1,0,0,0,
     ...section(1, vec(types)), ...section(2, vec(imports)), ...section(3, vec([[0]])),
-    ...section(7, vec([[...name('f'), 0, 7]])), ...section(10, vec([[...u(code.length), ...code]]))]);
+    ...section(7, vec([[...name('f'), 0, 8]])), ...section(10, vec([[...u(code.length), ...code]]))]);
 }
 const STR = [], SM = new Map();
 const OUTPUT_LIMIT = 3e5;
@@ -189,7 +191,7 @@ function genFn(f, sigs) {
   const look = n => { for (let k = scopes.length; k--;) if (scopes[k].has(n)) return scopes[k].get(n); };
   const decl = (n, ty, mut) => { const idx = nloc++; scopes.at(-1).set(n, { idx, ty, mut }); return idx; };
   const cap = fn => { const s = out; out = []; const r = fn(); const b = out; out = s; return [b, r]; };
-  const tIdx = (n, r) => { let k = tys.findIndex(t => t[0] === n && t[1] === r); if (k < 0) k = tys.push([n, r]) - 1; return 5 + k; };
+  const tIdx = (n, r) => { let k = tys.findIndex(t => t[0] === n && t[1] === r); if (k < 0) k = tys.push([n, r]) - 1; return 6 + k; };
   const tgt = tag => { for (let k = ctl.length; k--;) if (ctl[k].tag === tag) return k; return -1; };
   const dist = tag => ctl.length - 1 - tgt(tag);
   const want = (got, exp, line) => { if (got !== '!' && got !== exp && !(isStringType(got) && isStringType(exp))) throw err(`mismatched types: expected ${exp}, found ${got}`, line); };
@@ -221,7 +223,13 @@ function genFn(f, sigs) {
         e(C[o]); return 'bool';
       }
       case 'call': {
-        const s = sigs.get(n.name); if (!s) throw err(`cannot find function '${n.name}' in this scope`, n.line);
+        const s = sigs.get(n.name);
+        if (!s && n.name === 'draw_ball') {
+          if (n.args.length !== 3) throw err(`draw_ball takes 3 argument(s) but ${n.args.length} were supplied`, n.line);
+          n.args.forEach(a => want(gen(a), 'i32', a.line || n.line));
+          e(0x10, 7); return '()';
+        }
+        if (!s) throw err(`cannot find function '${n.name}' in this scope`, n.line);
         if (s.params.length !== n.args.length) throw err(`function '${n.name}' takes ${s.params.length} argument(s) but ${n.args.length} were supplied`, n.line);
         n.args.forEach((a, k) => want(gen(a), s.params[k], a.line || n.line));
         e(0x41, ...sleb(s.id), 0x11, ...u(tIdx(s.params.length, s.ret === '()' ? 0 : 1)), 0);
@@ -324,6 +332,7 @@ function genFn(f, sigs) {
 // ===== runtime: shared table, lazy stubs, hot swap ==========================
 const tbl = new WebAssembly.Table({ initial: 8, element: 'anyfunc' });
 let buf = '', byId = [], cur = new Map(), ids = new Map(), nid = 1, inst = 0;
+let animationRequest = null;
 const w = x => { buf += x; if (buf.length > OUTPUT_LIMIT) throw new Error('output limit exceeded'); };
 const mk = bytes => new WebAssembly.Instance(new WebAssembly.Module(bytes), { e: env }).exports.f;
 const env = {
@@ -346,6 +355,14 @@ const env = {
     }
     return strId(text);
   },
+  d: (x, y, radius) => {
+    if (radius < 0) throw new Error('draw_ball radius must be nonnegative');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.beginPath();
+    ctx.arc(x, y, radius, 0, Math.PI * 2);
+    ctx.fillStyle = '#f97316';
+    ctx.fill();
+  },
 };
 function stubFor(f) {
   const body = [0x41, ...sleb(f.id), 0x10, 0];
@@ -354,7 +371,41 @@ function stubFor(f) {
   return mk(buildModule(f.n, f.r, 0, body, []));
 }
 const $ = id => document.getElementById(id);
+const canvas = $('scene'), ctx = canvas.getContext('2d');
+const withRuntimeStrings = fn => {
+  const dynamicStart = STR.length;
+  runtimeStringBytes = 0;
+  try { return fn(); }
+  finally {
+    while (STR.length > dynamicStart) SM.delete(STR.pop());
+    runtimeStringBytes = 0;
+  }
+};
+const stopAnimation = () => {
+  if (animationRequest !== null) cancelAnimationFrame(animationRequest);
+  animationRequest = null;
+  $('stop').disabled = true;
+};
+function startAnimation(id) {
+  $('stop').disabled = false;
+  let start = null;
+  const tick = now => {
+    if (start === null) start = now;
+    const t = Math.floor((now - start) / 16) % 1000000;
+    try {
+      withRuntimeStrings(() => tbl.get(id)(t));
+      animationRequest = requestAnimationFrame(tick);
+    } catch (x) {
+      animationRequest = null;
+      $('stop').disabled = true;
+      $('rep').className = 'err';
+      $('rep').textContent = `animation error: ${x.message || x}`;
+    }
+  };
+  animationRequest = requestAnimationFrame(tick);
+}
 function run() {
+  stopAnimation(); ctx.clearRect(0, 0, canvas.width, canvas.height);
   buf = ''; inst = 0; runtimeStringBytes = 0; const rep = [];
   try {
     const items = parse(lex($('src').value)), sigs = new Map();
@@ -366,6 +417,10 @@ function run() {
     const m = sigs.get('main');
     if (!m) throw err("no 'fn main()' found", 1);
     if (m.params.length || m.ret !== '()') throw err("'main' must take no arguments and return ()", 1);
+    const frame = sigs.get('frame');
+    if (frame && (frame.params.length !== 1 || frame.params[0] !== 'i32' || frame.ret !== '()')) {
+      throw err("'frame' must have signature fn frame(t: i32)", items.find(f => f.name === 'frame').line);
+    }
     const next = new Map(); let size = 0;
     for (const f of items) {
       const bytes = genFn(f, sigs); size += bytes.length;
@@ -379,16 +434,15 @@ function run() {
     }
     cur = next; rep.unshift(`${items.length} function(s), ${size} bytes of wasm`);
     let fail = '';
-    const dynamicStart = STR.length;
-    try { tbl.get(m.id)(); }
+    try { withRuntimeStrings(() => tbl.get(m.id)()); }
     catch (x) { fail = x instanceof WebAssembly.RuntimeError ? `thread 'main' panicked: ${x.message}` : x instanceof RangeError ? "thread 'main' overflowed its stack" : String(x.message || x); }
-    finally {
-      while (STR.length > dynamicStart) SM.delete(STR.pop());
-      runtimeStringBytes = 0;
-    }
     $('out').textContent = buf + (fail ? '\n' + fail : '');
     rep.push(`ran main: ${inst} function module(s) instantiated lazily this run`);
     $('rep').className = ''; $('rep').textContent = rep.join('\n');
+    if (frame && !fail) {
+      $('rep').textContent += '\nanimation: frame(t: i32) is running';
+      startAnimation(frame.id);
+    }
   } catch (x) {
     $('out').textContent = '';
     $('rep').className = 'err';
@@ -398,6 +452,16 @@ function run() {
 
 // ===== examples and wiring ==================================================
 const EX = {
+  'Bouncy ball': `fn frame(t: i32) {
+    let horizontal = t % 432;
+    let x = if horizontal < 216 { 24 + horizontal * 2 } else { 24 + (432 - horizontal) * 2 };
+    let vertical = t % 180;
+    let y = if vertical < 90 { 24 + vertical * 2 } else { 24 + (180 - vertical) * 2 };
+    draw_ball(x, y, 14);
+}
+
+fn main() {}
+`,
   'String concatenation': `fn main() {
     let greeting: &str = "Hello";
     let target: String = "Rust";
@@ -464,6 +528,11 @@ fn main() {
 for (const k of Object.keys(EX)) $('ex').add(new Option(k, k));
 $('ex').onchange = () => { $('src').value = EX[$('ex').value]; run(); };
 $('run').onclick = run;
+$('stop').onclick = () => {
+  stopAnimation();
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  $('rep').textContent += '\nanimation stopped';
+};
 $('src').addEventListener('keydown', ev => { if ((ev.ctrlKey || ev.metaKey) && ev.key === 'Enter') { ev.preventDefault(); run(); } });
 $('src').value = EX['fib + primes']; run();
 </script>
